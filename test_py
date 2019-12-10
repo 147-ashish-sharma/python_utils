@@ -1,0 +1,94 @@
+import boto3
+import datetime
+import sys
+
+def lambda_handler(event, context):
+    ec2 = boto3.client('ec2')
+    retention_days = 7
+    create_time = datetime.datetime.now()
+    create_fmt = create_time.strftime('%Y-%m-%d-%H-%M')
+    ACCOUNT_ID = ''
+    list = []
+    list1 = []
+
+    filters = [{
+        'Name': 'tag:Backup',
+        'Values': ['yes']
+    }]
+
+    response = ec2.describe_instances(
+        Filters=filters
+    )
+
+    print(response)
+
+    for reservation in response['Reservations']:
+        for instance in reservation['Instances']:
+            try:
+                retention_days = [
+                    int(tag.get('Value')) for tag in instance['Tags']
+                    if tag['Key'] == 'Retention'][0]
+            except IndexError:
+                retention_days = 7
+
+            for tag in instance['Tags']:
+                if tag['Key'] == 'Name':
+                    name = tag.get('Value')
+
+            list.append(instance['InstanceId'])
+
+            print "creating AMI for instance: %s\nInstanceId: %s\nRetention Period: %s" %(name,instance['InstanceId'],retention_days)
+            AMIid = ec2.create_image(InstanceId=instance['InstanceId'],
+                                 Name="Lambda - " + name + " from " + create_fmt,
+                                 Description="Lambda created AMI of instance " + name + " from " + create_fmt,
+                                 NoReboot=True, DryRun=False)
+            print "AMI successfully created Image ID:", AMIid['ImageId']
+
+            delete_date = (datetime.date.today() + datetime.timedelta(days=retention_days)).strftime('%d-%m-%Y')
+
+            ec2.create_tags(
+                Resources=[AMIid['ImageId']],
+                Tags=[
+                    {'Key': 'DeleteOn', 'Value': delete_date},
+                    {'Key': 'Name', 'Value': "Lambda created AMI of " + name },
+                ]
+            )
+###delete old AMI
+    response = ec2.describe_images(
+        Filters= [{
+            'Name': 'tag-key',
+            'Values': ['DeleteOn']
+        }]
+    )
+
+
+    if not response['Images']:
+        print "No AMI found for deletation"
+        exit()
+
+    for ami in response['Images']:
+        list1.append(ami['ImageId'])
+        for tag in ami['Tags']:
+            if tag['Key'] == 'DeleteOn':
+                value = tag.get('Value')
+
+        delete_date = datetime.datetime.strptime(value, "%d-%m-%Y")
+#    print delete_date.date()
+#    print datetime.date.today()
+        if datetime.date.today() > delete_date.date() or datetime.date.today() == delete_date.date() :
+            print "deregistering image %s" % ami['ImageId']
+            ec2.deregister_image(
+                DryRun=False,
+                ImageId=ami['ImageId'],
+            )
+##delete AMI Snapshots
+            snapshots = ec2.describe_snapshots(MaxResults=1000, OwnerIds=[ACCOUNT_ID])['Snapshots']
+            for snapshot in snapshots:
+#        print "looking %s in snapshot %s snap id %s" % (i['ImageId'],snapshot['Description'],snapshot['SnapshotId'])
+                if snapshot['Description'].find(ami['ImageId']) > 0:
+                    snap = ec2.delete_snapshot(SnapshotId=snapshot['SnapshotId'])
+                    print "Deleting snapshot " + snapshot['SnapshotId']
+
+        else:
+            print "AMI %s is not eligible for deletation, The delete date is %s" % (ami['ImageId'],delete_date.date())
+
